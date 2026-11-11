@@ -1,0 +1,15 @@
+# For details & more options, see documentation/AppManifests.md in firmware repo
+
+App(
+    appid="flip_eread",  # Must be unique
+    name="eReader",  # Displayed in menus
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="flip_eread_app",
+    stack_size=4 * 1024,
+    fap_category="Tools",
+    fap_version="1.0",
+    fap_icon="flip_eread.png",  # 10x10 1-bit PNG
+    fap_description="Read .txt books from the SD card",
+    fap_icon_assets="images",
+    requires=["gui", "storage", "dialogs"],
+)
