@@ -41,3 +41,7 @@ Saved in `SD:/apps_data/flip_eread/`:
 - `<hash>.pos`: the saved position for each book (a byte offset)
 - `last_book.txt`: the path of the book you read last
 - `settings.txt`: your font choice
+
+## License
+
+MIT. See [LICENSE](LICENSE).
