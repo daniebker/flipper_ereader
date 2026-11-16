@@ -13,9 +13,16 @@
  *   Hold Right     jump forward 5%  (keep holding to keep jumping)
  *   Hold Left      jump back 5%
  *   OK             show / hide status bar (title + progress)
- *   Hold OK        toggle small / large font
+ *   Hold OK        open the menu: add / remove a bookmark on this page,
+ *                  list the book's bookmarks, switch font size
  *   Back           back to the file browser (position is saved)
  *   Hold Back      exit the app
+ *
+ * Controls (bookmark list):
+ *   Up / Down      select
+ *   OK             go to the bookmark
+ *   Hold OK        delete the bookmark
+ *   Back           back to the menu
  */
 
 #include <furi.h>
@@ -49,6 +56,18 @@
 #define BACK_WINDOW    4096
 #define LOOKAHEAD      (LINE_BUF * 4) /* bytes read past a seek target */
 #define JUMP_PERCENT   5
+#define MAX_BOOKMARKS  32
+#define SNIPPET_LEN    48
+
+/* menu overlay */
+#define MENU_W        100
+#define MENU_ITEM_H   11
+
+/* bookmark list */
+#define LIST_HEADER_H 12
+#define LIST_ROW_H    13
+#define LIST_ROWS     4
+#define LIST_PCT_W    22
 
 typedef enum {
     ReaderFontSmall = 0,
@@ -67,6 +86,19 @@ static const FontMetrics font_metrics[ReaderFontCount] = {
     [ReaderFontSmall] = {.font = FontSecondary, .line_height = 9, .baseline = 7, .lines = 7},
     [ReaderFontLarge] = {.font = FontPrimary, .line_height = 10, .baseline = 9, .lines = 6},
 };
+
+typedef enum {
+    ReaderModeRead,
+    ReaderModeMenu,
+    ReaderModeBookmarks,
+} ReaderMode;
+
+typedef enum {
+    MenuItemBookmark,
+    MenuItemList,
+    MenuItemFont,
+    MenuItemCount,
+} MenuItem;
 
 typedef enum {
     ReaderExitToBrowser,
@@ -94,6 +126,17 @@ typedef struct {
 
     uint8_t* page_buf;
     uint8_t* back_buf;
+
+    /* menu / bookmark list state */
+    ReaderMode mode;
+    uint8_t menu_index;
+    uint8_t list_index; /* selected bookmark */
+    uint8_t list_scroll; /* first visible bookmark */
+
+    /* bookmarks for the open book: byte offsets of page starts, ascending */
+    uint32_t bookmarks[MAX_BOOKMARKS];
+    uint8_t bookmark_count;
+    char snippets[MAX_BOOKMARKS][SNIPPET_LEN]; /* first line of text, for the list */
 
     FuriMutex* mutex;
     FuriMessageQueue* input_queue;
@@ -471,6 +514,70 @@ static void save_position(Storage* storage, const char* book, uint32_t pos) {
     furi_string_free(p);
 }
 
+static void bookmark_file_path(FuriString* out, const char* book) {
+    furi_string_printf(out, "%s/%08lX.bmk", DATA_DIR, (unsigned long)path_hash(book));
+}
+
+/* Insert keeping the list sorted and free of duplicates. */
+static bool bookmark_insert(Reader* r, uint32_t offset) {
+    uint8_t i = 0;
+    while(i < r->bookmark_count && r->bookmarks[i] < offset) i++;
+    if(i < r->bookmark_count && r->bookmarks[i] == offset) return true;
+    if(r->bookmark_count >= MAX_BOOKMARKS) return false;
+    memmove(
+        &r->bookmarks[i + 1], &r->bookmarks[i], (r->bookmark_count - i) * sizeof(uint32_t));
+    r->bookmarks[i] = offset;
+    r->bookmark_count++;
+    return true;
+}
+
+static void bookmark_remove(Reader* r, uint8_t i) {
+    if(i >= r->bookmark_count) return;
+    uint8_t tail = r->bookmark_count - i - 1;
+    memmove(&r->bookmarks[i], &r->bookmarks[i + 1], tail * sizeof(uint32_t));
+    memmove(r->snippets[i], r->snippets[i + 1], tail * SNIPPET_LEN);
+    r->bookmark_count--;
+}
+
+/* Bookmarks are stored one decimal byte offset per line. */
+static void load_bookmarks(Reader* r) {
+    r->bookmark_count = 0;
+    FuriString* p = furi_string_alloc();
+    bookmark_file_path(p, furi_string_get_cstr(r->path));
+    char buf[MAX_BOOKMARKS * 12 + 1];
+    if(read_small_file(r->storage, furi_string_get_cstr(p), buf, sizeof(buf))) {
+        char* s = buf;
+        while(*s && r->bookmark_count < MAX_BOOKMARKS) {
+            char* end;
+            unsigned long v = strtoul(s, &end, 10);
+            if(end == s) {
+                s++; /* skip junk */
+                continue;
+            }
+            /* drop bookmarks past the end (the file may have been edited) */
+            if(v < r->file_size) bookmark_insert(r, (uint32_t)v);
+            s = end;
+        }
+    }
+    furi_string_free(p);
+}
+
+static void save_bookmarks(Reader* r) {
+    FuriString* p = furi_string_alloc();
+    bookmark_file_path(p, furi_string_get_cstr(r->path));
+    if(r->bookmark_count == 0) {
+        storage_simply_remove(r->storage, furi_string_get_cstr(p));
+    } else {
+        FuriString* data = furi_string_alloc();
+        for(uint8_t i = 0; i < r->bookmark_count; i++) {
+            furi_string_cat_printf(data, "%lu\n", (unsigned long)r->bookmarks[i]);
+        }
+        write_small_file(r->storage, furi_string_get_cstr(p), furi_string_get_cstr(data));
+        furi_string_free(data);
+    }
+    furi_string_free(p);
+}
+
 static ReaderFont load_font(Storage* storage) {
     char buf[8];
     if(read_small_file(storage, SETTINGS_FILE, buf, sizeof(buf))) {
@@ -495,9 +602,141 @@ static uint8_t reader_percent(Reader* r) {
     return (uint8_t)((uint64_t)r->page_end * 100 / r->file_size);
 }
 
+static uint8_t offset_percent(Reader* r, uint32_t offset) {
+    if(r->file_size == 0) return 0;
+    return (uint8_t)((uint64_t)offset * 100 / r->file_size);
+}
+
+/* Index of a bookmark on the current page, or -1. */
+static int16_t reader_page_bookmark(Reader* r) {
+    for(uint8_t i = 0; i < r->bookmark_count; i++) {
+        uint32_t b = r->bookmarks[i];
+        if(b >= r->page_start && (b < r->page_end || b == r->page_start)) return i;
+    }
+    return -1;
+}
+
+/* Draw s at (x, y), cut short with ".." if it is wider than max_w. */
+static void draw_str_fit(Canvas* canvas, uint8_t x, uint8_t y, const char* s, uint16_t max_w) {
+    char buf[LINE_BUF];
+    strlcpy(buf, s, sizeof(buf));
+    size_t len = strlen(buf);
+    while(len > 0 && canvas_string_width(canvas, buf) > max_w) {
+        buf[--len] = '\0';
+        if(len >= 2) {
+            buf[len - 1] = '.';
+            buf[len - 2] = '.';
+        }
+    }
+    canvas_draw_str(canvas, x, y, buf);
+}
+
+/* A 5x7 bookmark ribbon with its top-left corner at (x, y). */
+static void draw_ribbon(Canvas* canvas, uint8_t x, uint8_t y) {
+    canvas_draw_box(canvas, x, y, 5, 5);
+    canvas_draw_line(canvas, x, y + 5, x + 1, y + 5);
+    canvas_draw_line(canvas, x + 3, y + 5, x + 4, y + 5);
+    canvas_draw_dot(canvas, x, y + 6);
+    canvas_draw_dot(canvas, x + 4, y + 6);
+}
+
+static void draw_menu(Canvas* canvas, Reader* r) {
+    char list_label[24];
+    snprintf(list_label, sizeof(list_label), "Bookmarks (%u)", r->bookmark_count);
+
+    const char* labels[MenuItemCount];
+    if(reader_page_bookmark(r) >= 0) {
+        labels[MenuItemBookmark] = "Remove bookmark";
+    } else if(r->bookmark_count >= MAX_BOOKMARKS) {
+        labels[MenuItemBookmark] = "Bookmarks full";
+    } else {
+        labels[MenuItemBookmark] = "Add bookmark";
+    }
+    labels[MenuItemList] = list_label;
+    labels[MenuItemFont] = r->font == ReaderFontSmall ? "Large font" : "Small font";
+
+    const uint8_t h = MenuItemCount * MENU_ITEM_H + 4;
+    const uint8_t x = (SCREEN_W - MENU_W) / 2;
+    const uint8_t y = (SCREEN_H - h) / 2;
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_box(canvas, x - 1, y - 1, MENU_W + 2, h + 2);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, x, y, MENU_W, h, 2);
+
+    for(uint8_t i = 0; i < MenuItemCount; i++) {
+        uint8_t iy = y + 2 + i * MENU_ITEM_H;
+        if(i == r->menu_index) {
+            canvas_draw_box(canvas, x + 2, iy, MENU_W - 4, MENU_ITEM_H);
+            canvas_set_color(canvas, ColorWhite);
+        }
+        canvas_draw_str(canvas, x + 5, iy + 8, labels[i]);
+        canvas_set_color(canvas, ColorBlack);
+    }
+}
+
+static void draw_bookmarks(Canvas* canvas, Reader* r) {
+    canvas_clear(canvas);
+    canvas_set_color(canvas, ColorBlack);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 10, "Bookmarks");
+    canvas_set_font(canvas, FontSecondary);
+    if(r->bookmark_count > 0) {
+        canvas_draw_str_aligned(canvas, SCREEN_W - 2, 10, AlignRight, AlignBottom, "Hold OK: del");
+    }
+    canvas_draw_line(canvas, 0, LIST_HEADER_H - 1, SCREEN_W - 1, LIST_HEADER_H - 1);
+
+    if(r->bookmark_count == 0) {
+        canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignCenter, "No bookmarks yet");
+        canvas_draw_str_aligned(
+            canvas, 64, 44, AlignCenter, AlignCenter, "Hold OK in a book to add");
+        return;
+    }
+
+    bool scrollbar = r->bookmark_count > LIST_ROWS;
+    uint8_t row_w = scrollbar ? SCREEN_W - 4 : SCREEN_W;
+
+    for(uint8_t row = 0; row < LIST_ROWS; row++) {
+        uint8_t i = r->list_scroll + row;
+        if(i >= r->bookmark_count) break;
+        uint8_t ry = LIST_HEADER_H + row * LIST_ROW_H;
+
+        if(i == r->list_index) {
+            canvas_draw_box(canvas, 0, ry, row_w, LIST_ROW_H);
+            canvas_set_color(canvas, ColorWhite);
+        }
+
+        char pct[6];
+        snprintf(pct, sizeof(pct), "%u%%", offset_percent(r, r->bookmarks[i]));
+        canvas_draw_str(canvas, 2, ry + 10, pct);
+        draw_str_fit(
+            canvas, LIST_PCT_W + 2, ry + 10, r->snippets[i], row_w - LIST_PCT_W - 4);
+        canvas_set_color(canvas, ColorBlack);
+    }
+
+    if(scrollbar) {
+        uint8_t track_y = LIST_HEADER_H;
+        uint8_t track_h = SCREEN_H - LIST_HEADER_H;
+        for(uint8_t y = track_y; y < SCREEN_H; y += 2) canvas_draw_dot(canvas, SCREEN_W - 2, y);
+        uint8_t thumb_h = track_h * LIST_ROWS / r->bookmark_count;
+        if(thumb_h < 3) thumb_h = 3;
+        uint8_t thumb_y = track_y + (track_h - thumb_h) * r->list_scroll /
+                                        (r->bookmark_count - LIST_ROWS);
+        canvas_draw_box(canvas, SCREEN_W - 3, thumb_y, 3, thumb_h);
+    }
+}
+
 static void draw_callback(Canvas* canvas, void* ctx) {
     Reader* r = ctx;
     furi_mutex_acquire(r->mutex, FuriWaitForever);
+
+    if(r->mode == ReaderModeBookmarks) {
+        draw_bookmarks(canvas, r);
+        furi_mutex_release(r->mutex);
+        return;
+    }
 
     const FontMetrics* fm = reader_metrics(r);
     canvas_clear(canvas);
@@ -522,6 +761,20 @@ static void draw_callback(Canvas* canvas, void* ctx) {
                                     (r->file_size > span ? r->file_size - span : 1));
         if(thumb_y + thumb_h > SCREEN_H) thumb_y = SCREEN_H - thumb_h;
         canvas_draw_box(canvas, SCROLLBAR_X, thumb_y, 3, thumb_h);
+
+        /* bookmark ticks next to the track */
+        for(uint8_t i = 0; i < r->bookmark_count; i++) {
+            uint8_t y = (uint8_t)((uint64_t)r->bookmarks[i] * (SCREEN_H - 1) / r->file_size);
+            canvas_draw_line(canvas, SCROLLBAR_X - 2, y, SCROLLBAR_X - 1, y);
+        }
+    }
+
+    /* ribbon in the top-right corner when this page is bookmarked */
+    if(reader_page_bookmark(r) >= 0) {
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, SCROLLBAR_X - 7, 0, 7, 8);
+        canvas_set_color(canvas, ColorBlack);
+        draw_ribbon(canvas, SCROLLBAR_X - 6, 0);
     }
 
     if(r->show_status) {
@@ -538,19 +791,11 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str(canvas, SCREEN_W - 3 - pct_w, SCREEN_H - 3, pct);
 
         /* title, truncated to fit */
-        char title[LINE_BUF];
-        strlcpy(title, furi_string_get_cstr(r->title), sizeof(title));
-        uint16_t max_w = SCREEN_W - 10 - pct_w;
-        size_t tl = strlen(title);
-        while(tl > 0 && canvas_string_width(canvas, title) > max_w) {
-            title[--tl] = '\0';
-            if(tl >= 2) {
-                title[tl - 1] = '.';
-                title[tl - 2] = '.';
-            }
-        }
-        canvas_draw_str(canvas, 3, SCREEN_H - 3, title);
+        draw_str_fit(
+            canvas, 3, SCREEN_H - 3, furi_string_get_cstr(r->title), SCREEN_W - 10 - pct_w);
     }
+
+    if(r->mode == ReaderModeMenu) draw_menu(canvas, r);
 
     furi_mutex_release(r->mutex);
 }
@@ -605,6 +850,133 @@ static void reader_jump(Reader* r, int8_t direction) {
     reader_layout_page(r);
 }
 
+static void reader_toggle_font(Reader* r) {
+    r->font = (r->font + 1) % ReaderFontCount;
+    save_font(r->storage, r->font);
+    r->page_start = reader_align(r, r->page_start);
+    reader_layout_page(r);
+}
+
+/* Remove the bookmark(s) on the current page, or add one at its start. */
+static void reader_toggle_bookmark(Reader* r) {
+    if(r->file_size == 0) return;
+    bool removed = false;
+    int16_t i;
+    while((i = reader_page_bookmark(r)) >= 0) {
+        bookmark_remove(r, (uint8_t)i);
+        removed = true;
+    }
+    if(!removed && !bookmark_insert(r, r->page_start)) return; /* list full */
+    save_bookmarks(r);
+}
+
+/* Fill r->snippets with the first non-empty line of text at each bookmark. */
+static void reader_load_snippets(Reader* r) {
+    const uint8_t* widths = r->widths[ReaderFontSmall];
+    char line[LINE_BUF];
+    for(uint8_t i = 0; i < r->bookmark_count; i++) {
+        uint32_t len = read_at(r, r->bookmarks[i], r->page_buf, LINE_BUF * 4);
+        size_t pos = 0;
+        line[0] = '\0';
+        while(pos < len) {
+            size_t next = layout_line(r->page_buf, len, pos, widths, line);
+            if(next == pos || line[0] != '\0') break;
+            pos = next;
+        }
+        strlcpy(r->snippets[i], line, SNIPPET_LEN);
+    }
+}
+
+static void list_scroll_to_selection(Reader* r) {
+    if(r->list_index < r->list_scroll) r->list_scroll = r->list_index;
+    if(r->list_index >= r->list_scroll + LIST_ROWS) r->list_scroll = r->list_index - LIST_ROWS + 1;
+    uint8_t max_scroll = r->bookmark_count > LIST_ROWS ? r->bookmark_count - LIST_ROWS : 0;
+    if(r->list_scroll > max_scroll) r->list_scroll = max_scroll;
+}
+
+static void reader_open_bookmark_list(Reader* r) {
+    reader_load_snippets(r);
+    /* preselect the last bookmark at or before the current page */
+    r->list_index = 0;
+    for(uint8_t i = 0; i < r->bookmark_count; i++) {
+        if(r->bookmarks[i] < r->page_end || r->bookmarks[i] == r->page_start) r->list_index = i;
+    }
+    r->list_scroll = 0;
+    list_scroll_to_selection(r);
+    r->mode = ReaderModeBookmarks;
+}
+
+static void reader_goto_bookmark(Reader* r, uint8_t i) {
+    if(i >= r->bookmark_count) return;
+    r->page_start = reader_align(r, r->bookmarks[i]);
+    reader_layout_page(r);
+    r->mode = ReaderModeRead;
+}
+
+static void handle_menu_input(Reader* r, InputEvent* ev) {
+    bool repeatable = ev->type == InputTypeShort || ev->type == InputTypeRepeat;
+    switch(ev->key) {
+    case InputKeyUp:
+        if(repeatable) r->menu_index = (r->menu_index + MenuItemCount - 1) % MenuItemCount;
+        break;
+    case InputKeyDown:
+        if(repeatable) r->menu_index = (r->menu_index + 1) % MenuItemCount;
+        break;
+    case InputKeyOk:
+        if(ev->type != InputTypeShort) break;
+        switch(r->menu_index) {
+        case MenuItemBookmark:
+            reader_toggle_bookmark(r);
+            r->mode = ReaderModeRead;
+            break;
+        case MenuItemList:
+            reader_open_bookmark_list(r);
+            break;
+        case MenuItemFont:
+            reader_toggle_font(r);
+            r->mode = ReaderModeRead;
+            break;
+        default:
+            break;
+        }
+        break;
+    case InputKeyLeft:
+    case InputKeyBack:
+        if(ev->type == InputTypeShort) r->mode = ReaderModeRead;
+        break;
+    default:
+        break;
+    }
+}
+
+static void handle_list_input(Reader* r, InputEvent* ev) {
+    bool repeatable = ev->type == InputTypeShort || ev->type == InputTypeRepeat;
+    switch(ev->key) {
+    case InputKeyUp:
+        if(repeatable && r->list_index > 0) r->list_index--;
+        break;
+    case InputKeyDown:
+        if(repeatable && r->list_index + 1 < r->bookmark_count) r->list_index++;
+        break;
+    case InputKeyOk:
+        if(ev->type == InputTypeShort) {
+            reader_goto_bookmark(r, r->list_index);
+        } else if(ev->type == InputTypeLong && r->bookmark_count > 0) {
+            bookmark_remove(r, r->list_index);
+            save_bookmarks(r);
+            if(r->list_index >= r->bookmark_count && r->list_index > 0) r->list_index--;
+        }
+        break;
+    case InputKeyLeft:
+    case InputKeyBack:
+        if(ev->type == InputTypeShort) r->mode = ReaderModeMenu;
+        break;
+    default:
+        break;
+    }
+    list_scroll_to_selection(r);
+}
+
 static ReaderExit reader_run(Reader* r, Gui* gui) {
     ViewPort* vp = view_port_alloc();
     view_port_draw_callback_set(vp, draw_callback, r);
@@ -620,6 +992,18 @@ static ReaderExit reader_run(Reader* r, Gui* gui) {
 
         furi_mutex_acquire(r->mutex, FuriWaitForever);
         bool repeatable = ev.type == InputTypeShort || ev.type == InputTypeRepeat;
+
+        /* Hold Back exits the app from anywhere */
+        if(r->mode != ReaderModeRead && !(ev.key == InputKeyBack && ev.type == InputTypeLong)) {
+            if(r->mode == ReaderModeMenu) {
+                handle_menu_input(r, &ev);
+            } else {
+                handle_list_input(r, &ev);
+            }
+            furi_mutex_release(r->mutex);
+            view_port_update(vp);
+            continue;
+        }
 
         switch(ev.key) {
         case InputKeyRight:
@@ -646,10 +1030,8 @@ static ReaderExit reader_run(Reader* r, Gui* gui) {
             if(ev.type == InputTypeShort) {
                 r->show_status = !r->show_status;
             } else if(ev.type == InputTypeLong) {
-                r->font = (r->font + 1) % ReaderFontCount;
-                save_font(r->storage, r->font);
-                r->page_start = reader_align(r, r->page_start);
-                reader_layout_page(r);
+                r->menu_index = MenuItemBookmark;
+                r->mode = ReaderModeMenu;
             }
             break;
         case InputKeyBack:
@@ -691,6 +1073,8 @@ static bool reader_open(Reader* r, DialogsApp* dialogs) {
     uint32_t pos = load_position(r->storage, path);
     r->page_start = pos < r->file_size ? reader_align(r, pos) : 0;
     r->show_status = false;
+    r->mode = ReaderModeRead;
+    load_bookmarks(r);
     reader_layout_page(r);
     return true;
 }
