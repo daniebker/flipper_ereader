@@ -56,7 +56,7 @@
 #define BACK_WINDOW    4096
 #define LOOKAHEAD      (LINE_BUF * 4) /* bytes read past a seek target */
 #define JUMP_PERCENT   5
-#define MAX_BOOKMARKS  32
+#define MAX_BOOKMARKS  256 /* 4 bytes each */
 #define SNIPPET_LEN    48
 
 /* menu overlay */
@@ -130,13 +130,18 @@ typedef struct {
     /* menu / bookmark list state */
     ReaderMode mode;
     uint8_t menu_index;
-    uint8_t list_index; /* selected bookmark */
-    uint8_t list_scroll; /* first visible bookmark */
+    uint16_t list_index; /* selected bookmark */
+    uint16_t list_scroll; /* first visible bookmark */
 
     /* bookmarks for the open book: byte offsets of page starts, ascending */
     uint32_t bookmarks[MAX_BOOKMARKS];
-    uint8_t bookmark_count;
-    char snippets[MAX_BOOKMARKS][SNIPPET_LEN]; /* first line of text, for the list */
+    uint16_t bookmark_count;
+
+    /* first line of text for the rows on screen in the bookmark list;
+     * row i is bookmark snippet_scroll + i */
+    char snippets[LIST_ROWS][SNIPPET_LEN];
+    uint16_t snippet_scroll;
+    bool snippets_valid;
 
     FuriMutex* mutex;
     FuriMessageQueue* input_queue;
@@ -520,7 +525,7 @@ static void bookmark_file_path(FuriString* out, const char* book) {
 
 /* Insert keeping the list sorted and free of duplicates. */
 static bool bookmark_insert(Reader* r, uint32_t offset) {
-    uint8_t i = 0;
+    uint16_t i = 0;
     while(i < r->bookmark_count && r->bookmarks[i] < offset) i++;
     if(i < r->bookmark_count && r->bookmarks[i] == offset) return true;
     if(r->bookmark_count >= MAX_BOOKMARKS) return false;
@@ -531,49 +536,79 @@ static bool bookmark_insert(Reader* r, uint32_t offset) {
     return true;
 }
 
-static void bookmark_remove(Reader* r, uint8_t i) {
+static void bookmark_remove(Reader* r, uint16_t i) {
     if(i >= r->bookmark_count) return;
-    uint8_t tail = r->bookmark_count - i - 1;
+    uint16_t tail = r->bookmark_count - i - 1;
     memmove(&r->bookmarks[i], &r->bookmarks[i + 1], tail * sizeof(uint32_t));
-    memmove(r->snippets[i], r->snippets[i + 1], tail * SNIPPET_LEN);
     r->bookmark_count--;
+    r->snippets_valid = false;
 }
 
-/* Bookmarks are stored one decimal byte offset per line. */
+/*
+ * Bookmarks are stored one decimal byte offset per line. The file is read and
+ * written through a small buffer so its size doesn't depend on the number of
+ * bookmarks.
+ */
 static void load_bookmarks(Reader* r) {
     r->bookmark_count = 0;
+    r->snippets_valid = false;
     FuriString* p = furi_string_alloc();
     bookmark_file_path(p, furi_string_get_cstr(r->path));
-    char buf[MAX_BOOKMARKS * 12 + 1];
-    if(read_small_file(r->storage, furi_string_get_cstr(p), buf, sizeof(buf))) {
-        char* s = buf;
-        while(*s && r->bookmark_count < MAX_BOOKMARKS) {
-            char* end;
-            unsigned long v = strtoul(s, &end, 10);
-            if(end == s) {
-                s++; /* skip junk */
-                continue;
+    File* f = storage_file_alloc(r->storage);
+
+    if(storage_file_open(f, furi_string_get_cstr(p), FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char buf[64];
+        uint64_t value = 0;
+        bool in_number = false;
+        size_t n;
+        while((n = storage_file_read(f, buf, sizeof(buf))) > 0) {
+            for(size_t i = 0; i < n; i++) {
+                char c = buf[i];
+                if(c >= '0' && c <= '9') {
+                    /* saturate instead of overflowing; too-big values are dropped */
+                    if(value <= UINT32_MAX) value = value * 10 + (uint64_t)(c - '0');
+                    in_number = true;
+                } else {
+                    /* any other byte ends a number; junk is skipped */
+                    if(in_number && value < r->file_size) bookmark_insert(r, (uint32_t)value);
+                    value = 0;
+                    in_number = false;
+                }
             }
-            /* drop bookmarks past the end (the file may have been edited) */
-            if(v < r->file_size) bookmark_insert(r, (uint32_t)v);
-            s = end;
         }
+        if(in_number && value < r->file_size) bookmark_insert(r, (uint32_t)value);
     }
+
+    storage_file_close(f);
+    storage_file_free(f);
     furi_string_free(p);
 }
 
 static void save_bookmarks(Reader* r) {
     FuriString* p = furi_string_alloc();
     bookmark_file_path(p, furi_string_get_cstr(r->path));
+    const char* path = furi_string_get_cstr(p);
+
     if(r->bookmark_count == 0) {
-        storage_simply_remove(r->storage, furi_string_get_cstr(p));
+        storage_simply_remove(r->storage, path);
     } else {
-        FuriString* data = furi_string_alloc();
-        for(uint8_t i = 0; i < r->bookmark_count; i++) {
-            furi_string_cat_printf(data, "%lu\n", (unsigned long)r->bookmarks[i]);
+        storage_simply_mkdir(r->storage, DATA_DIR);
+        File* f = storage_file_alloc(r->storage);
+        if(storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+            char buf[64];
+            size_t used = 0;
+            for(uint16_t i = 0; i < r->bookmark_count; i++) {
+                if(used + 12 > sizeof(buf)) {
+                    storage_file_write(f, buf, used);
+                    used = 0;
+                }
+                used += snprintf(
+                    buf + used, sizeof(buf) - used, "%lu\n", (unsigned long)r->bookmarks[i]);
+            }
+            if(used > 0) storage_file_write(f, buf, used);
         }
-        write_small_file(r->storage, furi_string_get_cstr(p), furi_string_get_cstr(data));
-        furi_string_free(data);
+        storage_file_close(f);
+        storage_file_free(f);
     }
     furi_string_free(p);
 }
@@ -609,7 +644,7 @@ static uint8_t offset_percent(Reader* r, uint32_t offset) {
 
 /* Index of a bookmark on the current page, or -1. */
 static int16_t reader_page_bookmark(Reader* r) {
-    for(uint8_t i = 0; i < r->bookmark_count; i++) {
+    for(uint16_t i = 0; i < r->bookmark_count; i++) {
         uint32_t b = r->bookmarks[i];
         if(b >= r->page_start && (b < r->page_end || b == r->page_start)) return i;
     }
@@ -699,7 +734,7 @@ static void draw_bookmarks(Canvas* canvas, Reader* r) {
     uint8_t row_w = scrollbar ? SCREEN_W - 4 : SCREEN_W;
 
     for(uint8_t row = 0; row < LIST_ROWS; row++) {
-        uint8_t i = r->list_scroll + row;
+        uint16_t i = r->list_scroll + row;
         if(i >= r->bookmark_count) break;
         uint8_t ry = LIST_HEADER_H + row * LIST_ROW_H;
 
@@ -712,7 +747,7 @@ static void draw_bookmarks(Canvas* canvas, Reader* r) {
         snprintf(pct, sizeof(pct), "%u%%", offset_percent(r, r->bookmarks[i]));
         canvas_draw_str(canvas, 2, ry + 10, pct);
         draw_str_fit(
-            canvas, LIST_PCT_W + 2, ry + 10, r->snippets[i], row_w - LIST_PCT_W - 4);
+            canvas, LIST_PCT_W + 2, ry + 10, r->snippets[row], row_w - LIST_PCT_W - 4);
         canvas_set_color(canvas, ColorBlack);
     }
 
@@ -763,7 +798,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_box(canvas, SCROLLBAR_X, thumb_y, 3, thumb_h);
 
         /* bookmark ticks next to the track */
-        for(uint8_t i = 0; i < r->bookmark_count; i++) {
+        for(uint16_t i = 0; i < r->bookmark_count; i++) {
             uint8_t y = (uint8_t)((uint64_t)r->bookmarks[i] * (SCREEN_H - 1) / r->file_size);
             canvas_draw_line(canvas, SCROLLBAR_X - 2, y, SCROLLBAR_X - 1, y);
         }
@@ -863,18 +898,34 @@ static void reader_toggle_bookmark(Reader* r) {
     bool removed = false;
     int16_t i;
     while((i = reader_page_bookmark(r)) >= 0) {
-        bookmark_remove(r, (uint8_t)i);
+        bookmark_remove(r, (uint16_t)i);
         removed = true;
     }
     if(!removed && !bookmark_insert(r, r->page_start)) return; /* list full */
     save_bookmarks(r);
 }
 
-/* Fill r->snippets with the first non-empty line of text at each bookmark. */
+static void list_scroll_to_selection(Reader* r) {
+    if(r->list_index < r->list_scroll) r->list_scroll = r->list_index;
+    if(r->list_index >= r->list_scroll + LIST_ROWS) r->list_scroll = r->list_index - LIST_ROWS + 1;
+    uint16_t max_scroll = r->bookmark_count > LIST_ROWS ? r->bookmark_count - LIST_ROWS : 0;
+    if(r->list_scroll > max_scroll) r->list_scroll = max_scroll;
+}
+
+/*
+ * Fill r->snippets with the first non-empty line of text at each bookmark on
+ * screen. Only re-reads the book when the visible rows changed.
+ */
 static void reader_load_snippets(Reader* r) {
+    if(r->snippets_valid && r->snippet_scroll == r->list_scroll) return;
+
     const uint8_t* widths = r->widths[ReaderFontSmall];
     char line[LINE_BUF];
-    for(uint8_t i = 0; i < r->bookmark_count; i++) {
+    for(uint8_t row = 0; row < LIST_ROWS; row++) {
+        uint16_t i = r->list_scroll + row;
+        r->snippets[row][0] = '\0';
+        if(i >= r->bookmark_count) continue;
+
         uint32_t len = read_at(r, r->bookmarks[i], r->page_buf, LINE_BUF * 4);
         size_t pos = 0;
         line[0] = '\0';
@@ -883,30 +934,26 @@ static void reader_load_snippets(Reader* r) {
             if(next == pos || line[0] != '\0') break;
             pos = next;
         }
-        strlcpy(r->snippets[i], line, SNIPPET_LEN);
+        strlcpy(r->snippets[row], line, SNIPPET_LEN);
     }
-}
-
-static void list_scroll_to_selection(Reader* r) {
-    if(r->list_index < r->list_scroll) r->list_scroll = r->list_index;
-    if(r->list_index >= r->list_scroll + LIST_ROWS) r->list_scroll = r->list_index - LIST_ROWS + 1;
-    uint8_t max_scroll = r->bookmark_count > LIST_ROWS ? r->bookmark_count - LIST_ROWS : 0;
-    if(r->list_scroll > max_scroll) r->list_scroll = max_scroll;
+    r->snippet_scroll = r->list_scroll;
+    r->snippets_valid = true;
 }
 
 static void reader_open_bookmark_list(Reader* r) {
-    reader_load_snippets(r);
     /* preselect the last bookmark at or before the current page */
     r->list_index = 0;
-    for(uint8_t i = 0; i < r->bookmark_count; i++) {
+    for(uint16_t i = 0; i < r->bookmark_count; i++) {
         if(r->bookmarks[i] < r->page_end || r->bookmarks[i] == r->page_start) r->list_index = i;
     }
     r->list_scroll = 0;
     list_scroll_to_selection(r);
+    r->snippets_valid = false;
+    reader_load_snippets(r);
     r->mode = ReaderModeBookmarks;
 }
 
-static void reader_goto_bookmark(Reader* r, uint8_t i) {
+static void reader_goto_bookmark(Reader* r, uint16_t i) {
     if(i >= r->bookmark_count) return;
     r->page_start = reader_align(r, r->bookmarks[i]);
     reader_layout_page(r);
@@ -975,6 +1022,7 @@ static void handle_list_input(Reader* r, InputEvent* ev) {
         break;
     }
     list_scroll_to_selection(r);
+    if(r->mode == ReaderModeBookmarks) reader_load_snippets(r);
 }
 
 static ReaderExit reader_run(Reader* r, Gui* gui) {

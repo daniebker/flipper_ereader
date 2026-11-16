@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bookmarks. Hold OK while reading to open a menu where you can bookmark the
   current page (or remove its bookmark) and list all bookmarks for the book.
   The list shows each bookmark's percentage and first line of text; OK jumps
-  to it and holding OK deletes it. Up to 32 bookmarks per book, stored in
+  to it and holding OK deletes it. Up to 256 bookmarks per book, stored in
   `SD:/apps_data/flip_eread/<hash>.bmk`.
 - Bookmark ticks beside the position bar, and a ribbon in the top-right
   corner when the current page is bookmarked.

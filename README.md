@@ -52,7 +52,7 @@ Up/Down to choose, OK to select, Back to close.
 
 Each entry shows how far into the book it is and the first line of text on
 that page. Up/Down to choose, OK to go to it, hold OK to delete it, Back to
-return to the menu. Up to 32 bookmarks per book.
+return to the menu. Up to 256 bookmarks per book.
 
 ## Data
 
